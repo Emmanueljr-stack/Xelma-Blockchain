@@ -3,7 +3,7 @@
 
 use super::config_helpers::apply_max_stake;
 use crate::contract::{VirtualTokenContract, VirtualTokenContractClient};
-use crate::types::{DataKeyCore, DataKeyScoped};
+use crate::types::{DataKeyCore, DataKeyExt, DataKeyScoped};
 use soroban_sdk::testutils::storage::Persistent as _;
 use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
 
@@ -23,7 +23,9 @@ fn test_schema_version_and_admin_ttl_extended_on_interaction() {
     // SchemaVersion and Admin are long-lived keys.
     // Verify they are extended to BUMP_AMOUNT (518_400 ledgers)
     let schema_ttl = env.as_contract(&contract_id, || {
-        env.storage().persistent().get_ttl(&DataKeyCore::SchemaVersion)
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKeyCore::SchemaVersion)
     });
     assert!(schema_ttl >= 518_400);
 
@@ -146,9 +148,7 @@ fn test_batch_touch_ttl_touches_allowlisted_keys() {
 
     // Verify each key now has a fresh TTL
     for key in keys.iter() {
-        let ttl = env.as_contract(&contract_id, || {
-            env.storage().persistent().get_ttl(&key)
-        });
+        let ttl = env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key));
         assert!(
             ttl >= 518_400,
             "TTL for key should be bumped to at least BUMP_AMOUNT"
@@ -174,7 +174,7 @@ fn test_batch_touch_ttl_skips_absent_keys() {
         [
             DataKeyCore::Admin,
             DataKeyCore::CloseBufferLedgers, // not set during init
-            DataKeyCore::MaxStake,            // not set during init
+            DataKeyCore::MaxStake,           // not set during init
         ],
     );
 
@@ -198,9 +198,81 @@ fn test_batch_touch_ttl_rejects_non_allowlisted_key() {
     let keys: Vec<DataKeyCore> = Vec::from_array(&env, [DataKeyCore::ActiveRound]);
 
     let result = client.try_batch_touch_ttl(&keys);
+    assert!(result.is_err(), "non-allowlisted key should be rejected");
+}
+
+#[test]
+fn test_batch_touch_ttl_accepts_dispute_and_quorum_keys() {
+    let env = Env::default();
+    let contract_id = env.register(VirtualTokenContract, ());
+    let client = VirtualTokenContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin, &oracle);
+
+    // Neither key is set by initialize, so both should be skipped (not
+    // touched) but must NOT be rejected as unsupported.
+    let keys: Vec<DataKeyCore> = Vec::from_array(
+        &env,
+        [DataKeyCore::DisputeLedgers, DataKeyCore::OracleQuorum],
+    );
+
+    let result = client.try_batch_touch_ttl(&keys);
+    assert!(
+        result.is_ok(),
+        "DisputeLedgers and OracleQuorum should be allowlisted"
+    );
+}
+
+#[test]
+fn test_batch_touch_ttl_accepts_season_stats_and_archive_keys() {
+    let env = Env::default();
+    let contract_id = env.register(VirtualTokenContract, ());
+    let client = VirtualTokenContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin, &oracle);
+
+    let keys: Vec<DataKeyCore> = Vec::from_array(
+        &env,
+        [
+            DataKeyCore::Ext(DataKeyExt::SeasonUserStats(1, user.clone())),
+            DataKeyCore::Ext(DataKeyExt::SeasonArchive(1)),
+        ],
+    );
+
+    let result = client.try_batch_touch_ttl(&keys);
+    assert!(
+        result.is_ok(),
+        "SeasonUserStats and SeasonArchive should be allowlisted"
+    );
+}
+
+#[test]
+fn test_batch_touch_ttl_still_rejects_governance_keys() {
+    let env = Env::default();
+    let contract_id = env.register(VirtualTokenContract, ());
+    let client = VirtualTokenContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let oracle = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin, &oracle);
+
+    // ConstitutionMetadata (Issue #363 governance) is intentionally out of
+    // scope for this TTL pass and must remain rejected.
+    let keys: Vec<DataKeyCore> =
+        Vec::from_array(&env, [DataKeyCore::Ext(DataKeyExt::ConstitutionMetadata)]);
+
+    let result = client.try_batch_touch_ttl(&keys);
     assert!(
         result.is_err(),
-        "non-allowlisted key should be rejected"
+        "ConstitutionMetadata should remain outside the TTL-touch allowlist"
     );
 }
 
