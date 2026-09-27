@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
 extern crate alloc;
-use alloc::vec::Vec as StdVec;
 use crate::admin::{
     _ensure_not_paused, _load_attestation_config, _load_deviation_config, _load_hb_config,
     _require_supported_schema,
@@ -11,9 +10,7 @@ use crate::common::{
     DEFAULT_ORACLE_TIMESTAMP_SKEW, MAX_CLAIM_BATCH_SIZE, MAX_ORACLE_OBSERVATIONS,
     SECONDS_PER_LEDGER, TTL_BUMP_AMOUNT, TTL_BUMP_THRESHOLD,
 };
-use crate::config::{
-    _apply_protocol_fee_precision, _apply_protocol_fee_updown, _read_fee_model,
-};
+use crate::config::{_apply_protocol_fee_precision, _apply_protocol_fee_updown, _read_fee_model};
 use crate::errors::ContractError;
 use crate::settlement_math::{
     classify_price_direction, compute_deviation_bps, compute_updown_winner_payout,
@@ -22,11 +19,12 @@ use crate::settlement_math::{
 use crate::storage::clear_round_storage;
 use crate::types::{
     ArchivedRoundSummary, BetSide, DataKeyCore, DataKeyScoped, DeviationReferenceMode,
-    HbGateConfig, LeaderboardEntry, MultiFeedPayload, OracleHeartbeatRecord, OraclePayload,
-    OracleQuorumConfig, OneSidedPolicy, PendingWinningsUpdatedAtKey, PrecisionCommitment,
+    HbGateConfig, LeaderboardEntry, MultiFeedPayload, OneSidedPolicy, OracleHeartbeatRecord,
+    OraclePayload, OracleQuorumConfig, PendingWinningsUpdatedAtKey, PrecisionCommitment,
     PrecisionPayoutPolicy, PrecisionPrediction, PriceSample, Round, RoundArchiveStatus, RoundMode,
     TwapSamplesKey, UserOutcomeType, UserPosition, UserRoundOutcome, UserStats,
 };
+use alloc::vec::Vec as StdVec;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, Env, Map, Symbol, Vec};
 
@@ -210,7 +208,9 @@ pub fn cancel_round(env: Env, reason: u32) -> Result<(), ContractError> {
                     }
 
                     participant_stakes.push_back(refund_amount);
-                    total_stake = total_stake.checked_add(refund_amount).unwrap_or(total_stake);
+                    total_stake = total_stake
+                        .checked_add(refund_amount)
+                        .unwrap_or(total_stake);
 
                     if refund_amount > 0 {
                         _accumulate_pending(&env, user.clone(), refund_amount)?;
@@ -244,7 +244,8 @@ pub fn cancel_round(env: Env, reason: u32) -> Result<(), ContractError> {
             }
         }
         if total_coverage > 0 {
-            let distributed = crate::insurance::deduct_insurance_coverage(&env, round_id, total_coverage)?;
+            let distributed =
+                crate::insurance::deduct_insurance_coverage(&env, round_id, total_coverage)?;
             // Distribute coverage proportionally to participants
             if distributed > 0 && total_stake > 0 {
                 for i in 0..participants.len() {
@@ -954,7 +955,11 @@ pub fn resolve_round_multi(env: Env, payload: MultiFeedPayload) -> Result<(), Co
         .checked_sub(round.start_ledger)
         .ok_or(ContractError::Overflow)?;
     let round_end_estimate = round_start
-        .checked_add((round_duration_ledgers as u64).checked_mul(SECONDS_PER_LEDGER).ok_or(ContractError::Overflow)?)
+        .checked_add(
+            (round_duration_ledgers as u64)
+                .checked_mul(SECONDS_PER_LEDGER)
+                .ok_or(ContractError::Overflow)?,
+        )
         .ok_or(ContractError::Overflow)?;
 
     let lower_bound = round_start.saturating_sub(skew);
@@ -1365,7 +1370,9 @@ fn _complete_settlement(
 
     env.storage().persistent().remove(&DataKeyCore::ActiveRound);
     env.storage().persistent().remove(&DataKeyCore::Positions);
-    env.storage().persistent().remove(&DataKeyCore::UpDownPositions);
+    env.storage()
+        .persistent()
+        .remove(&DataKeyCore::UpDownPositions);
     // A merge left this guarded re-remove of the active round split across
     // two fragments (the `if` keyword and its condition were separated from
     // the body). Rejoined here so the file parses again.
@@ -1503,8 +1510,6 @@ pub fn void_round(env: Env, round_id: u64) -> Result<(), ContractError> {
     Ok(())
 }
 
-/// Permissionlessly finalizes the staged oracle result once the dispute window
-/// has closed. Calling at the exact deadline is allowed.
 pub fn finalize_round(env: Env, round_id: u64) -> Result<(), ContractError> {
     _require_supported_schema(&env)?;
     _ensure_not_paused(&env)?;
@@ -1514,13 +1519,17 @@ pub fn finalize_round(env: Env, round_id: u64) -> Result<(), ContractError> {
         return Err(ContractError::RoundNotEnded);
     }
 
+    // Effects: clear the dispute record before settling, so no state write
+    // happens after `_complete_settlement`'s own `round.resolved` event
+    // (Issue #553 CEI fix).
+    _remove_pending_dispute(&env, round_id);
+
     let (fee_amount, participant_count) = _complete_settlement(
         &env,
         &pending.round,
         pending.final_price,
         pending.confidence,
     )?;
-    _remove_pending_dispute(&env, round_id);
 
     #[allow(deprecated)]
     env.events().publish(
@@ -1561,10 +1570,7 @@ pub fn _apply_one_sided_policy(
                     _record_refunds_legacy(env, round.round_id, pos_map)?;
                 }
             }
-            (
-                round.pool_up.saturating_add(round.pool_down),
-                0i128,
-            )
+            (round.pool_up.saturating_add(round.pool_down), 0i128)
         }
         OneSidedPolicy::CarryForward => {
             if !participants.is_empty() {
@@ -1575,10 +1581,7 @@ pub fn _apply_one_sided_policy(
                     _record_refunds_legacy(env, round.round_id, pos_map)?;
                 }
             }
-            (
-                0i128,
-                round.pool_up.saturating_add(round.pool_down),
-            )
+            (0i128, round.pool_up.saturating_add(round.pool_down))
         }
     };
 
@@ -2052,19 +2055,6 @@ pub fn _resolve_precision_mode(
                     let stake = participant_amounts[idx];
                     let predicted_price = participant_prices[idx];
 
-                    if !participant_revealed[idx] {
-                        #[allow(deprecated)]
-                        env.events().publish(
-                            (symbol_short!("forfeit"), symbol_short!("predict")),
-                            (user.clone(), round_id, stake),
-                        );
-                    }
-
-                    #[allow(deprecated)]
-                    env.events().publish(
-                        (symbol_short!("outcome"), symbol_short!("loss")),
-                        (user.clone(), round_id, 1u32, stake, 0u32, predicted_price),
-                    );
                     _update_stats_loss(env, user.clone())?;
 
                     _persist_user_outcome(
@@ -2077,6 +2067,20 @@ pub fn _resolve_precision_mode(
                         stake,
                         0,
                         UserOutcomeType::Loss,
+                    );
+
+                    if !participant_revealed[idx] {
+                        #[allow(deprecated)]
+                        env.events().publish(
+                            (symbol_short!("forfeit"), symbol_short!("predict")),
+                            (user.clone(), round_id, stake),
+                        );
+                    }
+
+                    #[allow(deprecated)]
+                    env.events().publish(
+                        (symbol_short!("outcome"), symbol_short!("loss")),
+                        (user.clone(), round_id, 1u32, stake, 0u32, predicted_price),
                     );
                 }
             }
@@ -2325,18 +2329,6 @@ pub fn _record_winnings_indexed(
                         BetSide::Up => 0,
                         BetSide::Down => 1,
                     };
-                    #[allow(deprecated)]
-                    env.events().publish(
-                        (symbol_short!("outcome"), symbol_short!("loss")),
-                        (
-                            user.clone(),
-                            round_id,
-                            0u32,
-                            position.amount,
-                            side_value,
-                            0u128,
-                        ),
-                    );
                     _update_stats_loss(env, user.clone())?;
 
                     _persist_user_outcome(
@@ -2349,6 +2341,19 @@ pub fn _record_winnings_indexed(
                         position.amount,
                         0,
                         UserOutcomeType::Loss,
+                    );
+
+                    #[allow(deprecated)]
+                    env.events().publish(
+                        (symbol_short!("outcome"), symbol_short!("loss")),
+                        (
+                            user.clone(),
+                            round_id,
+                            0u32,
+                            position.amount,
+                            side_value,
+                            0u128,
+                        ),
                     );
                 }
             }
@@ -2870,5 +2875,4 @@ pub fn _update_stats_loss(env: &Env, user: Address) -> Result<(), ContractError>
     crate::leaderboard::_update_leaderboards(env, user.clone());
     crate::leaderboard::_update_season_stats_loss(env, user)?;
     Ok(())
-
 }
